@@ -52,6 +52,18 @@ pub struct OcrEngineParams {
     /// Enable debug logging.
     pub debug: bool,
 
+    /// Recognize each rectangle returned by the detection model independently
+    /// instead of first merging them into lines with layout analysis.
+    ///
+    /// This matches the PaddleOCR / RapidOCR pipeline, which runs recognition
+    /// once per detection output box. It is the correct granularity when the
+    /// detection model already emits one box per text line or per table cell
+    /// (eg. PP-OCR DB models): ocrs's own layout analysis would otherwise merge
+    /// boxes that share a visual row but belong to different table columns,
+    /// which inflates the crop passed to the recognition model and destroys
+    /// small text.
+    pub rec_per_detected_rect: bool,
+
     /// Method used to decode outputs of text recognition model.
     pub decode_method: DecodeMethod,
 
@@ -98,6 +110,7 @@ struct OcrEngineParamsImpl<M: Model> {
     alphabet: Option<String>,
     alphabet_chars: Option<Vec<char>>,
     allowed_chars: Option<String>,
+    rec_per_detected_rect: bool,
 }
 
 impl From<OcrEngineParams> for OcrEngineParamsImpl<rten::Model> {
@@ -110,6 +123,7 @@ impl From<OcrEngineParams> for OcrEngineParamsImpl<rten::Model> {
             alphabet,
             alphabet_chars,
             allowed_chars,
+            rec_per_detected_rect,
         } = params;
 
         Self {
@@ -120,6 +134,7 @@ impl From<OcrEngineParams> for OcrEngineParamsImpl<rten::Model> {
             alphabet,
             alphabet_chars,
             allowed_chars,
+            rec_per_detected_rect,
         }
     }
 }
@@ -134,6 +149,11 @@ pub struct OcrEngine {
     debug: bool,
     decode_method: DecodeMethod,
     alphabet_chars: Vec<char>,
+
+    /// When true, recognition runs once per detected rect rather than once per
+    /// line produced by layout analysis. See
+    /// [`OcrEngineParams::rec_per_detected_rect`].
+    rec_per_detected_rect: bool,
 
     /// Indices of characters in `alphabet` that are excluded from recognition
     /// output. See [`OcrEngineParams::allowed_chars`].
@@ -206,6 +226,7 @@ impl OcrEngine {
             excluded_char_labels,
             debug: params.debug,
             decode_method: params.decode_method,
+            rec_per_detected_rect: params.rec_per_detected_rect,
         })
     }
 
@@ -307,7 +328,16 @@ impl OcrEngine {
         _input: &OcrInput,
         words: &[RotatedRect],
     ) -> Vec<Vec<RotatedRect>> {
-        find_text_lines(words)
+        let lines = find_text_lines(words);
+        if self.rec_per_detected_rect {
+            // Keep the reading order that layout analysis computed, but make
+            // each detected rect its own line so that recognition runs once per
+            // rect (matching PaddleOCR / RapidOCR) instead of once per merged
+            // line.
+            lines.into_iter().flatten().map(|rect| vec![rect]).collect()
+        } else {
+            lines
+        }
     }
 
     /// Recognize lines of text in an image.
