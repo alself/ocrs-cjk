@@ -25,12 +25,13 @@ mod wasm_api;
 pub mod cjk_text;
 pub use cjk_text::{cjk_alphabet, cjk_alphabet_chars, is_cjk, segment};
 
-use detection::{TextDetector, TextDetectorParams};
+use detection::TextDetector;
 use layout_analysis::find_text_lines;
 use model::Model;
 use preprocess::{prepare_image, prepare_image_imagenet, BLACK_VALUE as PREPROCESS_BLACK_VALUE};
 use recognition::{RecognitionOpt, TextRecognizer};
 
+pub use detection::TextDetectorParams;
 pub use preprocess::{DimOrder, ImagePixels, ImageSource, ImageSourceError};
 pub use recognition::DecodeMethod;
 pub use text_items::{TextChar, TextItem, TextLine, TextWord};
@@ -63,6 +64,13 @@ pub struct OcrEngineParams {
     /// which inflates the crop passed to the recognition model and destroys
     /// small text.
     pub rec_per_detected_rect: bool,
+
+    /// Parameters controlling post-processing of the detection model's output.
+    ///
+    /// Set [`TextDetectorParams::unclip_ratio`] when using a PaddleOCR DB
+    /// detection model, which predicts boxes that are shrunk relative to the
+    /// text and must be expanded back before recognition.
+    pub detection_params: TextDetectorParams,
 
     /// Method used to decode outputs of text recognition model.
     pub decode_method: DecodeMethod,
@@ -111,6 +119,7 @@ struct OcrEngineParamsImpl<M: Model> {
     alphabet_chars: Option<Vec<char>>,
     allowed_chars: Option<String>,
     rec_per_detected_rect: bool,
+    detection_params: TextDetectorParams,
 }
 
 impl From<OcrEngineParams> for OcrEngineParamsImpl<rten::Model> {
@@ -124,6 +133,7 @@ impl From<OcrEngineParams> for OcrEngineParamsImpl<rten::Model> {
             alphabet_chars,
             allowed_chars,
             rec_per_detected_rect,
+            detection_params,
         } = params;
 
         Self {
@@ -135,6 +145,7 @@ impl From<OcrEngineParams> for OcrEngineParamsImpl<rten::Model> {
             alphabet_chars,
             allowed_chars,
             rec_per_detected_rect,
+            detection_params,
         }
     }
 }
@@ -181,9 +192,12 @@ impl OcrEngine {
     fn new_impl<M: Model + Send + Sync + 'static>(
         params: OcrEngineParamsImpl<M>,
     ) -> anyhow::Result<OcrEngine> {
+        // Copy `detection_params` out first: `detection_model` is moved by the
+        // `map` below and the closure cannot also move the params field.
+        let detection_params = params.detection_params.clone();
         let detector = params
             .detection_model
-            .map(|model| TextDetector::from_model(model, Default::default()))
+            .map(|model| TextDetector::from_model(model, detection_params))
             .transpose()?;
         let recognizer = params
             .recognition_model

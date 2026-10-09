@@ -5,7 +5,8 @@ use std::io::{BufWriter, IsTerminal, Read};
 
 use anyhow::{anyhow, Context};
 use ocrs_cjk::{
-    DecodeMethod, DimOrder, ImageSource, OcrEngine, OcrEngineParams, OcrInput, TextItem,
+    DecodeMethod, DimOrder, ImageSource, OcrEngine, OcrEngineParams, OcrInput, TextDetectorParams,
+    TextItem,
 };
 use rten_imageproc::RotatedRect;
 use rten_tensor::prelude::*;
@@ -135,6 +136,11 @@ struct Args {
     /// lines first. Matches the PaddleOCR / RapidOCR pipeline.
     rec_per_box: bool,
 
+    /// Expand each detected box outwards using PaddleOCR's `DBPostProcess`
+    /// unclip ratio (`area * ratio / perimeter`). Only meaningful for
+    /// PaddleOCR DB detection models.
+    det_unclip: Option<f32>,
+
     /// Filter characters produced by text recognition
     /// This must be a sub-set of `alphabet`.
     allowed_chars: Option<String>,
@@ -212,6 +218,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     let mut text_map = false;
     let mut text_mask = false;
     let mut rec_per_box = false;
+    let mut det_unclip = None;
     let mut lang = false;
     let mut tables = false;
     let mut confidence_heatmap: Option<String> = None;
@@ -354,6 +361,14 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("rec-per-box") => {
                 rec_per_box = true;
+            }
+            Long("det-unclip") => {
+                let v: f32 = parser
+                    .value()?
+                    .string()?
+                    .parse()
+                    .map_err(|_| "invalid --det-unclip value (expected a ratio, eg. 1.5)")?;
+                det_unclip = Some(v.max(0.));
             }
             Long("help") => {
                 println!(
@@ -531,6 +546,12 @@ Advanced options:
     Recognize each detected box independently instead of merging boxes into
     lines first. Matches the PaddleOCR / RapidOCR pipeline; significantly
     better on tables and other multi-column layouts.
+
+  --det-unclip <RATIO>
+
+    Expand each detected box outwards by `area * RATIO / perimeter` before
+    recognition, following PaddleOCR's DBPostProcess. PaddleOCR uses 1.5.
+    Only meaningful for PaddleOCR DB detection models.
 ",
                     bin_name = parser.bin_name().unwrap_or("ocrs")
                 );
@@ -616,6 +637,7 @@ Advanced options:
         text_mask,
         text_line_images,
         rec_per_box,
+        det_unclip,
         allowed_chars,
         tables,
         confidence_heatmap,
@@ -763,6 +785,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         allowed_chars: args.allowed_chars,
         rec_per_detected_rect: args.rec_per_box,
+        detection_params: TextDetectorParams {
+            unclip_ratio: args.det_unclip.unwrap_or(0.),
+            ..Default::default()
+        },
         ..Default::default()
     })?;
 
