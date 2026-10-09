@@ -31,6 +31,19 @@ pub struct TextDetectorParams {
     /// Threshold for per-pixel scores in output segmentation mask for
     /// classifying a pixel as text.
     pub text_threshold: f32,
+
+    /// Ratio used to expand each detected rect outwards, following PaddleOCR's
+    /// `DBPostProcess` "unclip" step.
+    ///
+    /// PaddleOCR's DB detection models are trained to predict a region that is
+    /// *smaller* than the text, so the predicted box has to be grown back
+    /// before it is passed to recognition. The distance applied to a rect is
+    /// `area * unclip_ratio / perimeter`. PaddleOCR defaults to `1.5`.
+    ///
+    /// ocrs's original behaviour is a fixed `expand_dist` for every rect, which
+    /// is too small for narrow boxes and truncates the leading or trailing
+    /// glyph. Set this to `0.` to keep that behaviour.
+    pub unclip_ratio: f32,
 }
 
 impl Default for TextDetectorParams {
@@ -43,8 +56,29 @@ impl Default for TextDetectorParams {
 
             // Ideally the threshold would be 0.5 as a neutral value.
             text_threshold: 0.2,
+
+            // Disabled by default: the DB "shrink then unclip" convention only
+            // applies to PaddleOCR detection models. ocrs's own model is not
+            // trained that way.
+            unclip_ratio: 0.,
         }
     }
+}
+
+/// Distance to expand `rect` by, per PaddleOCR's `DBPostProcess` unclip step:
+/// `area * unclip_ratio / perimeter`.
+///
+/// Returns `None` when unclip is disabled (`unclip_ratio <= 0.`) or the rect is
+/// degenerate, in which case the caller falls back to its fixed `expand_dist`.
+fn unclip_distance(rect: &RotatedRect, unclip_ratio: f32) -> Option<f32> {
+    if unclip_ratio <= 0. {
+        return None;
+    }
+    let perimeter = 2. * (rect.width() + rect.height());
+    if perimeter <= 0. {
+        return None;
+    }
+    Some(rect.area() * unclip_ratio / perimeter)
 }
 
 /// Find the minimum-area oriented rectangles containing each connected
@@ -52,6 +86,7 @@ impl Default for TextDetectorParams {
 fn find_connected_component_rects(
     mask: NdTensorView<bool, 2>,
     expand_dist: f32,
+    unclip_ratio: f32,
     min_area: f32,
 ) -> Vec<RotatedRect> {
     find_contours(mask, RetrievalMode::External)
@@ -61,10 +96,8 @@ fn find_connected_component_rects(
             let simplified = simplify_polygon(&float_points, 2. /* epsilon */);
 
             min_area_rect(&simplified).map(|mut rect| {
-                rect.resize(
-                    rect.width() + 2. * expand_dist,
-                    rect.height() + 2. * expand_dist,
-                );
+                let dist = unclip_distance(&rect, unclip_ratio).unwrap_or(expand_dist);
+                rect.resize(rect.width() + 2. * dist, rect.height() + 2. * dist);
                 rect
             })
         })
@@ -141,11 +174,15 @@ impl TextDetector {
         // Distance to expand bounding boxes by. This is useful when the model is
         // trained to assign a positive label to pixels in a smaller area than the
         // ground truth, which may be done to create separation between adjacent
-        // objects.
+        // objects. Used as-is unless `unclip_ratio` overrides it per rect.
         let expand_dist = 3.;
 
-        let word_rects =
-            find_connected_component_rects(binary_mask.view(), expand_dist, self.params.min_area);
+        let word_rects = find_connected_component_rects(
+            binary_mask.view(),
+            expand_dist,
+            self.params.unclip_ratio,
+            self.params.min_area,
+        );
 
         Ok(word_rects)
     }
@@ -260,12 +297,64 @@ impl TextDetector {
 
 #[cfg(test)]
 mod tests {
-    use rten_imageproc::{fill_rect, Point};
+    use rten_imageproc::{fill_rect, Point, RectF, RotatedRect};
     use rten_tensor::prelude::*;
     use rten_tensor::NdTensor;
 
-    use super::find_connected_component_rects;
+    use super::{find_connected_component_rects, unclip_distance};
     use crate::test_util::gen_rect_grid;
+
+    #[test]
+    fn test_unclip_distance() {
+        // PaddleOCR's DBPostProcess: distance = area * unclip_ratio / perimeter.
+        // For a 50x10 rect: 500 * 1.5 / (2 * (50 + 10)) = 6.25.
+        let rect = RotatedRect::from_rect(RectF::from_tlbr(0., 0., 10., 50.));
+        assert_eq!(unclip_distance(&rect, 1.5), Some(6.25));
+
+        // Unclip disabled: the caller falls back to its fixed expand distance.
+        assert_eq!(unclip_distance(&rect, 0.), None);
+        assert_eq!(unclip_distance(&rect, -1.), None);
+
+        // Degenerate rect has no perimeter to divide by.
+        let flat = RotatedRect::from_rect(RectF::from_tlbr(0., 0., 0., 0.));
+        assert_eq!(unclip_distance(&flat, 1.5), None);
+    }
+
+    #[test]
+    fn test_find_connected_component_rects_unclip() {
+        let (rect_h, rect_w) = (10, 50);
+        let mut mask = NdTensor::zeros([100, 100]);
+        let rects = gen_rect_grid(
+            Point::from_yx(10, 10),
+            (1, 1),           /* grid_shape */
+            (rect_h, rect_w), /* rect_size */
+            (10, 5),          /* gap_size */
+        );
+        for r in rects.iter() {
+            fill_rect(mask.view_mut(), r.adjust_tlbr(0, 0, 1, 1), true);
+        }
+
+        let min_area = 100.;
+        let plain = find_connected_component_rects(mask.view(), 0., 0., min_area);
+        let unclipped = find_connected_component_rects(mask.view(), 0., 1.5, min_area);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(unclipped.len(), 1);
+
+        // A 10x50 mask component is expanded by 6.25 on each side.
+        let expected = (rect_w as f32 + 2. * 6.25, rect_h as f32 + 2. * 6.25);
+        assert!(
+            (unclipped[0].width() - expected.0).abs() < 1.,
+            "width {} != expected {}",
+            unclipped[0].width(),
+            expected.0
+        );
+        assert!(
+            (unclipped[0].height() - expected.1).abs() < 1.,
+            "height {} != expected {}",
+            unclipped[0].height(),
+            expected.1
+        );
+    }
 
     #[test]
     fn test_find_connected_component_rects() {
@@ -286,7 +375,7 @@ mod tests {
         }
 
         let min_area = 100.;
-        let components = find_connected_component_rects(mask.view(), 0., min_area);
+        let components = find_connected_component_rects(mask.view(), 0., 0., min_area);
         assert_eq!(components.len() as i32, grid_h * grid_w);
 
         for c in components.iter() {
