@@ -131,6 +131,10 @@ struct Args {
     /// Extract each text line found and save as a PNG image.
     text_line_images: bool,
 
+    /// Recognize each detected box independently, without merging boxes into
+    /// lines first. Matches the PaddleOCR / RapidOCR pipeline.
+    rec_per_box: bool,
+
     /// Filter characters produced by text recognition
     /// This must be a sub-set of `alphabet`.
     allowed_chars: Option<String>,
@@ -207,6 +211,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     let mut text_line_images = false;
     let mut text_map = false;
     let mut text_mask = false;
+    let mut rec_per_box = false;
     let mut lang = false;
     let mut tables = false;
     let mut confidence_heatmap: Option<String> = None;
@@ -346,6 +351,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("text-mask") => {
                 text_mask = true;
+            }
+            Long("rec-per-box") => {
+                rec_per_box = true;
             }
             Long("help") => {
                 println!(
@@ -517,6 +525,12 @@ Advanced options:
   --text-mask
 
     Generate a binary text mask for the input image
+
+  --rec-per-box
+
+    Recognize each detected box independently instead of merging boxes into
+    lines first. Matches the PaddleOCR / RapidOCR pipeline; significantly
+    better on tables and other multi-column layouts.
 ",
                     bin_name = parser.bin_name().unwrap_or("ocrs")
                 );
@@ -601,6 +615,7 @@ Advanced options:
         text_map,
         text_mask,
         text_line_images,
+        rec_per_box,
         allowed_chars,
         tables,
         confidence_heatmap,
@@ -747,6 +762,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             DecodeMethod::Greedy
         },
         allowed_chars: args.allowed_chars,
+        rec_per_detected_rect: args.rec_per_box,
         ..Default::default()
     })?;
 
